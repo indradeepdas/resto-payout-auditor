@@ -13,6 +13,12 @@ Analytics schema
 - csv_downloaded
 - excel_downloaded
 - payout_discrepancy_detected
+- recovery_summary_generated
+- claim_pack_generated
+- claim_pack_json_downloaded
+- claim_pack_csv_downloaded
+- consent_updated
+- privacy_request_created
 */
 
 const POSTHOG_KEY = import.meta.env.VITE_PUBLIC_POSTHOG_KEY;
@@ -20,6 +26,7 @@ const POSTHOG_HOST = import.meta.env.VITE_PUBLIC_POSTHOG_HOST;
 const ANALYTICS_ENABLED = Boolean(POSTHOG_KEY && POSTHOG_HOST);
 const NORMALIZED_POSTHOG_HOST = POSTHOG_HOST ? POSTHOG_HOST.replace(/\/+$/, '') : '';
 const DISTINCT_ID_STORAGE_KEY = 'posthog_distinct_id';
+const ANALYTICS_CONSENT_STORAGE_KEY = 'analytics_consent_v1';
 const POSTHOG_CONFIG = {
   autocapture: false,
   capture_pageview: false,
@@ -33,7 +40,7 @@ const POSTHOG_CONFIG = {
 };
 
 let initialized = false;
-let initAttempted = false;
+let analyticsConsentGranted = false;
 
 const sanitizeProperties = (properties = {}) =>
   Object.fromEntries(
@@ -123,18 +130,44 @@ const getDistinctId = () => {
   return persistDistinctId(generateDistinctId());
 };
 
+const persistConsentState = (granted, decided = true) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(
+    ANALYTICS_CONSENT_STORAGE_KEY,
+    JSON.stringify({ granted: Boolean(granted), decided: Boolean(decided) }),
+  );
+};
+
+const readConsentState = () => {
+  if (typeof window === 'undefined') {
+    return { granted: false, decided: false };
+  }
+
+  try {
+    const rawValue = window.localStorage.getItem(ANALYTICS_CONSENT_STORAGE_KEY);
+    if (!rawValue) {
+      return { granted: false, decided: false };
+    }
+
+    const parsedValue = JSON.parse(rawValue);
+    return {
+      granted: Boolean(parsedValue?.granted),
+      decided: Boolean(parsedValue?.decided),
+    };
+  } catch {
+    return { granted: false, decided: false };
+  }
+};
+
 export const initAnalytics = () => {
   if (initialized) {
     return posthog;
   }
 
-  if (typeof window === 'undefined') {
-    return null;
-  }
-
-  initAttempted = true;
-
-  if (!ANALYTICS_ENABLED) {
+  if (typeof window === 'undefined' || !ANALYTICS_ENABLED || !analyticsConsentGranted) {
     return null;
   }
 
@@ -160,35 +193,84 @@ export const initAnalytics = () => {
   }
 };
 
+export const bootstrapAnalyticsConsent = () => {
+  const storedConsent = readConsentState();
+  analyticsConsentGranted = storedConsent.granted && storedConsent.decided;
+
+  if (analyticsConsentGranted) {
+    initAnalytics();
+  }
+
+  return storedConsent;
+};
+
+export const setAnalyticsConsent = (granted, options = {}) => {
+  const shouldPersist = options.persist !== false;
+
+  analyticsConsentGranted = Boolean(granted);
+
+  if (shouldPersist) {
+    persistConsentState(granted, true);
+  }
+
+  if (!analyticsConsentGranted) {
+    if (initialized) {
+      try {
+        posthog.opt_out_capturing();
+        posthog.reset();
+      } catch (error) {
+        console.warn('PostHog opt-out failed', error);
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(DISTINCT_ID_STORAGE_KEY);
+    }
+
+    return false;
+  }
+
+  const client = initAnalytics();
+  if (client) {
+    try {
+      client.opt_in_capturing();
+    } catch {
+      return true;
+    }
+  }
+
+  return true;
+};
+
+export const hasAnalyticsConsent = () => analyticsConsentGranted;
+
 export const trackEvent = (eventName, properties = {}) => {
-  if (!ANALYTICS_ENABLED) {
+  if (!ANALYTICS_ENABLED || !analyticsConsentGranted) {
     return;
   }
 
   const client = initAnalytics();
   if (!client) {
-    console.warn('PostHog track skipped: analytics is unavailable');
     return;
   }
 
-  const distinctId = getDistinctId();
-  const eventProperties = sanitizeProperties({
-    ...properties,
-    distinct_id: distinctId,
-  });
-
-  client.capture(eventName, eventProperties);
+  client.capture(
+    eventName,
+    sanitizeProperties({
+      ...properties,
+      distinct_id: getDistinctId(),
+    }),
+  );
 };
 
 export const identifyUser = (userId, properties = {}) => {
-  if (!ANALYTICS_ENABLED || !userId) {
+  if (!ANALYTICS_ENABLED || !analyticsConsentGranted || !userId) {
     return;
   }
 
   persistDistinctId(userId);
   const client = initAnalytics();
   if (!client) {
-    console.warn('PostHog identify skipped: analytics is unavailable');
     return;
   }
 
@@ -196,17 +278,15 @@ export const identifyUser = (userId, properties = {}) => {
 };
 
 export const resetAnalytics = () => {
-  if (!ANALYTICS_ENABLED) {
+  if (!ANALYTICS_ENABLED || !initialized) {
     return;
   }
 
-  const client = initAnalytics();
-  if (!client) {
-    console.warn('PostHog reset skipped: analytics is unavailable');
-    return;
+  try {
+    posthog.reset();
+  } catch (error) {
+    console.warn('PostHog reset failed', error);
   }
-
-  client.reset();
 };
 
 export const analyticsConfig = POSTHOG_CONFIG;
